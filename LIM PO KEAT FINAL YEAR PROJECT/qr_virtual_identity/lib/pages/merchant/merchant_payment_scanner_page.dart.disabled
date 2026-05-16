@@ -1,0 +1,176 @@
+import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+
+class MerchantPaymentScannerPage extends StatefulWidget {
+  final String scanPointId;
+  final Map<String, dynamic> cartItems;
+  final double totalAmount;
+  final VoidCallback onComplete;
+
+  const MerchantPaymentScannerPage({
+    super.key,
+    required this.scanPointId,
+    required this.cartItems,
+    required this.totalAmount,
+    required this.onComplete,
+  });
+
+  @override
+  State<MerchantPaymentScannerPage> createState() =>
+      _MerchantPaymentScannerPageState();
+}
+
+class _MerchantPaymentScannerPageState
+    extends State<MerchantPaymentScannerPage> {
+  bool isProcessing = false;
+
+  Future<void> processPayment(String uid) async {
+    if (isProcessing) return;
+    setState(() {
+      isProcessing = true;
+    });
+
+    final db = FirebaseFirestore.instance;
+
+    try {
+      // Get user
+      final userDoc = await db.collection('users').doc(uid).get();
+
+      if (!userDoc.exists) {
+        showError("User not found");
+        return;
+      }
+
+      final balance = (userDoc['balance'] ?? 0).toDouble();
+      if (balance < widget.totalAmount) {
+        showError("Insufficient balance");
+        return;
+      }
+
+      // Deduct balance
+      await db.collection('users').doc(uid).update({
+        'balance': balance - widget.totalAmount,
+      });
+
+      // Write interaction
+      await db.collection('interactions').add({
+        'user_id': uid,
+        'user_email': userDoc['email'],
+        'scan_point_id': widget.scanPointId,
+        'scan_point_name': 'Smokey Café',
+        'type': 'purchase',
+        'status': 'success',
+        'amount': widget.totalAmount,
+        'currency': 'MYR',
+        'payment_method': 'QR Pay',
+        'items': widget.cartItems,
+        'timestamp': FieldValue.serverTimestamp(),
+        'created_at': FieldValue.serverTimestamp(),
+      });
+
+      // Show success
+      showSuccess();
+    } catch (e) {
+      showError("Payment failed: $e");
+    }
+  }
+
+  void showError(String msg) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Error"),
+        content: Text(msg),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              setState(() {
+                isProcessing = false;
+              });
+            },
+            child: const Text("OK"),
+          )
+        ],
+      ),
+    );
+  }
+
+  void showSuccess() {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Payment Successful"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.check_circle, color: Colors.green, size: 80),
+            const SizedBox(height: 16),
+            Text('Total: RM ${widget.totalAmount.toStringAsFixed(2)}'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context); // Close dialog
+              Navigator.pop(context, true); // Return to POS page
+              widget.onComplete(); // Clear cart
+            },
+            child: const Text("Done"),
+          )
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.deepPurple,
+        title: const Text("Scan User QR"),
+      ),
+      body: Column(
+        children: [
+          // Instructions
+          Container(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                Text(
+                  'Total: RM ${widget.totalAmount.toStringAsFixed(2)}',
+                  style: const TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Ask customer to show their QR code',
+                  style: TextStyle(fontSize: 16),
+                ),
+              ],
+            ),
+          ),
+          // Scanner
+          Expanded(
+            child: MobileScanner(
+              onDetect: (capture) {
+                if (isProcessing) return;
+
+                final List<Barcode> barcodes = capture.barcodes;
+                if (barcodes.isNotEmpty) {
+                  final raw = barcodes.first.rawValue ?? "";
+                  if (raw.isNotEmpty) {
+                    processPayment(raw);
+                  }
+                }
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

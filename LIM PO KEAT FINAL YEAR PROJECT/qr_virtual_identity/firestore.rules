@@ -1,0 +1,249 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper function to check if user is updating their own document
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    // Helper function to check if user is an admin
+    function isAdmin() {
+      return exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // ---------------------------------------------------------
+    // 🔒 RESTRICTED COLLECTIONS (Backend Write Only)
+    // ---------------------------------------------------------
+
+    // Nonce Blacklist - Backend Only
+    match /nonce_blacklist/{id} {
+      allow read: if false;
+      allow write: if false; // Only backend (admin SDK) can write
+    }
+
+    // Interactions (Logs) - Read-only for clients, Write via Cloud Functions
+    match /interactions/{interactionId} {
+      // ⚠️ FYP Prototype: Allow public read
+      allow read: if true;
+      // Allow authenticated users to create their own interaction records (for Top Up / Transfer)
+      allow create: if isAuthenticated() && request.resource.data.user_id == request.auth.uid;
+      allow write: if false; // Default deny for other writes (update/delete)
+    }
+
+    // Scan Points - Read-only for clients (stats updated by backend)
+    // Allow owner to update 'last_active'
+    match /scan_points/{scanPointId} {
+      // ⚠️ FYP Prototype: Allow public read to support Desktop Login Bypass
+      allow read: if true;
+      allow update: if (isAuthenticated() 
+        && resource.data.owner_uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['last_active']))
+        || isAdmin();
+      allow write: if false; // Other writes restricted
+
+      // Allow access to products subcollection
+      match /products/{productId} {
+        // ⚠️ FYP Prototype: Allow public read to ensure POS loads data even if auth fails
+        allow read: if true;
+        // Allow owner to update products (needed for migration and management)
+        allow update: if isAuthenticated() 
+          && get(/databases/$(database)/documents/scan_points/$(scanPointId)).data.owner_uid == request.auth.uid;
+        allow create, delete: if false; // Only backend/admin can create/delete products
+      }
+    }
+
+    // Scanner Status - Used for Desktop <-> Mobile handshake
+    match /scanner_status/{userId} {
+      // ⚠️ FYP Prototype: Allow public access for reading (Desktop needs it)
+      allow read: if true;
+      // ⚠️ FYP Prototype: Allow public write because Desktop QR Login bypasses Auth (request.auth is null)
+      allow write: if true; 
+    }
+
+    // Scanner Triggers - Used for Desktop to wake up Mobile
+    match /scanner_triggers/{triggerId} {
+      // ⚠️ FYP Prototype: Allow public access
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Library Sessions - Read-only for clients (managed by backend)
+    match /library_sessions/{sessionId} {
+      allow read: if isAuthenticated();
+      allow write: if false; // Only backend can update session state
+    }
+
+    // 🔐 Login Sessions - Used for Desktop QR Login
+    match /login_sessions/{sessionId} {
+      // Allow anyone to create a session (Desktop App - unauthenticated)
+      allow create: if true;
+      // Allow authenticated users to update (Mobile App - authorizing)
+      allow update: if isAuthenticated();
+      // Allow reading (Desktop App listens for changes)
+      allow read: if true;
+    }
+
+    // Book Loans - Read-only for clients (managed by backend)
+    match /book_loans/{loanId} {
+      allow read: if isAuthenticated();
+      allow write: if false; // Only backend can create/update loans
+    }
+
+    // ---------------------------------------------------------
+    // 🛡️ ADMINS COLLECTION
+    // ---------------------------------------------------------
+    match /admins/{adminId} {
+      // Allow read if the user is looking up their own admin record by email or UID
+      allow read: if isAuthenticated() && 
+        (request.auth.uid == adminId || resource.data.email == request.auth.token.email);
+      allow write: if false; // Only backend can manage admins
+    }
+
+    // ---------------------------------------------------------
+    // 👤 USERS COLLECTION
+    // ---------------------------------------------------------
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      
+      // Allow users to update their own profile, BUT...
+      // DENY updates to sensitive fields: balance, access_permissions
+      allow update: if (isOwner(userId) 
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['balance', 'access_permissions', 'is_blacklisted']))
+        || isAdmin();
+      
+      // Allow create if authenticated (e.g. first login)
+      allow create: if isAuthenticated() && isOwner(userId);
+    }
+
+    // ---------------------------------------------------------
+    // 📚 BOOKS COLLECTION
+    // ---------------------------------------------------------
+    match /books/{bookId} {
+      allow read: if isAuthenticated();
+      allow write: if false; // Only backend/admin can manage books
+    }
+
+    // ---------------------------------------------------------
+    // 🎉 EVENTS COLLECTION
+    // ---------------------------------------------------------
+    match /events/{eventId} {
+      allow read: if true;
+      // Allow authenticated users to update attendees (join/leave)
+      allow update: if isAuthenticated() 
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['attendees', 'current_attendees', 'updated_at', 'organizer', 'date']);
+      allow write: if false; // Only backend/admin for creation/deletion
+      
+      match /attendees/{attendeeId} {
+        allow read: if isAuthenticated();
+        allow write: if false; // Check-in handled by verifyEventQR
+      }
+      
+      match /checkpoints/{checkpointId} {
+        allow read: if isAuthenticated();
+        allow write: if false;
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 🎫 USER TICKETS COLLECTION
+    // ---------------------------------------------------------
+    match /user_tickets/{ticketId} {
+      // Allow users to read/write their own tickets
+      // Allow users to read/write their own tickets, and allow verifiers (authenticated) to read
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.user_id == request.auth.uid;
+      allow update: if isAuthenticated() && (
+        resource.data.user_id == request.auth.uid ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'attended_at', 'checked_in_at', 'checked_in_by', 'updated_at'])
+      );
+      allow delete: if isAuthenticated() && resource.data.user_id == request.auth.uid;
+    }
+
+    // ---------------------------------------------------------
+    // 📅 USER EVENTS COLLECTION
+    // ---------------------------------------------------------
+    match /user_events/{userId} {
+      // ⚠️ FYP Prototype: Allow public read to avoid permission issues during demo
+      allow read: if true;
+      allow write: if isOwner(userId) || isAdmin();
+      
+      match /joined_events/{eventId} {
+        // ⚠️ FYP Prototype: Allow public read
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin();
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 🪵 LOGS COLLECTION
+    // ---------------------------------------------------------
+    match /logs/{logId} {
+      allow read: if false; // Internal logs
+      allow write: if false; // Only backend
+    }
+
+    // ---------------------------------------------------------
+    // 🛡️ AUDIT LOGS (Backend Only)
+    // ---------------------------------------------------------
+    // ---------------------------------------------------------
+    // 👑 ADMINS COLLECTION
+    // ---------------------------------------------------------
+    match /admins/{adminId} {
+      // Allow admin to read/write their own document (for session updates)
+      // Allow other admins to read/write (for management)
+      allow read: if isOwner(adminId) || isAdmin();
+      allow write: if isOwner(adminId) || isAdmin();
+    }
+
+    // ---------------------------------------------------------
+    // 🛡️ AUDIT LOGS (Admin Read Only)
+    // ---------------------------------------------------------
+    match /audit_logs/{docId} {
+      allow read: if isAdmin();
+      allow write: if false; // Only backend can write
+    }
+
+    // ---------------------------------------------------------
+    // 🚨 ANOMALIES (Admin Read/Delete)
+    // ---------------------------------------------------------
+    match /anomalies/{docId} {
+      allow read: if isAdmin();
+      allow delete: if isAdmin();
+      allow write: if false; // Only backend can create/update
+    }
+
+    // ---------------------------------------------------------
+    // 📨 SUPPORT TICKETS
+    // ---------------------------------------------------------
+    match /support_tickets/{ticketId} {
+      // Allow authenticated users to create tickets
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      // Allow users to read their own tickets
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      // Only admins can update status (e.g. resolve)
+      allow update: if isAdmin();
+    }
+
+    // ---------------------------------------------------------
+    // 🛡️ LOGIN ATTEMPTS (Rate Limiting)
+    // ---------------------------------------------------------
+    match /login_attempts/{email} {
+      // ⚠️ Allow public read/write for login rate limiting
+      // This is necessary because users are not authenticated yet when checking/writing attempts.
+      // In production, this should be handled by Cloud Functions to prevent abuse,
+      // but for this FYP implementation, client-side logic is accepted.
+      allow read, write: if true;
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
